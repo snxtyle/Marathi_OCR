@@ -1,0 +1,69 @@
+# Secrets & local env — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+secrets/
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ALL runtime data under data/ (keep only the layout README)
+/data/*
+!/data/README.md
+
+# Legacy data dirs at repo root (if recreated)
+/raw/
+/rendered/
+/candidates/
+/reviewed/
+/final/
+/sources/
+/.cache/
+
+# Heavy / generated artifacts anywhere
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.pdf
+*.jsonl
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Logs / temp / Streamlit secrets
+*.log
+tmp/
+temp/
+.streamlit/secrets.toml

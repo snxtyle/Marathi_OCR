@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+import re
+import unicodedata
+from typing import Any
+
+from pipeline.char_limits import char_count, in_char_band
+from scoring.reference_detector import reference_pattern_score
+
+MARATHI_DIGITS = "०१२३४५६७८९"
+ASCII_DIGITS = "0123456789"
+SPECIAL_CHARS = "/.,-—:;()[]*%₹«»“”|"
+# Devanagari matras / vowel signs
+MATRA_RE = re.compile(r"[\u093A-\u094C\u094E\u094F\u0955-\u0957\u0962\u0963]")
+VIRAMA = "\u094d"
+HARD_SYMBOL_RE = re.compile(r"[/₹%—–:;\[\]*]|प्र\.?\s*क्र|शासन\s*निर्णय|अधिसूचना")
+SLASH_ID_RE = re.compile(r"[०-९0-9].*/.*[०-९0-9]|प्र\.?\s*क्र")
+
+TRIVIAL_REJECT = [
+    re.compile(r"^महाराष्ट्र\.?$"),
+    re.compile(r"^आज\s+हवामान"),
+    re.compile(r"^अचूक\s+प्रतिमेतील"),
+    re.compile(r"^महाराष्ट्र\s+सुंदर"),
+]
+
+
+def _count_chars(text: str, alphabet: str) -> int:
+    return sum(text.count(c) for c in alphabet)
+
+
+def estimate_conjuncts(text: str) -> int:
+    return text.count(VIRAMA)
+
+
+def matra_score(text: str) -> float:
+    n = len(MATRA_RE.findall(text or ""))
+    return float(min(n, 20)) * 0.08
+
+
+def compute_features(text: str) -> dict[str, Any]:
+    text = unicodedata.normalize("NFC", text or "")
+    words = [w for w in re.split(r"\s+", text.strip()) if w]
+    length = len(text)
+    special = _count_chars(text, SPECIAL_CHARS)
+    marathi_digits = _count_chars(text, MARATHI_DIGITS)
+    ascii_digits = _count_chars(text, ASCII_DIGITS)
+    return {
+        "marathi_digit_count": marathi_digits,
+        "ascii_digit_count": ascii_digits,
+        "slash_count": text.count("/"),
+        "period_count": text.count("."),
+        "comma_count": text.count(","),
+        "hyphen_count": text.count("-"),
+        "dash_count": text.count("—") + text.count("–"),
+        "colon_count": text.count(":"),
+        "semicolon_count": text.count(";"),
+        "bracket_count": sum(text.count(c) for c in "()[]{}"),
+        "symbol_count": special,
+        "currency_count": text.count("₹") + text.count("रु."),
+        "percent_count": text.count("%"),
+        "conjunct_estimate": estimate_conjuncts(text),
+        "matra_score": matra_score(text),
+        "text_length": length,
+        "char_count": char_count(text),
+        "word_count": len(words),
+        "numeric_density": (marathi_digits + ascii_digits) / max(length, 1),
+        "special_character_density": special / max(length, 1),
+        "reference_pattern_score": reference_pattern_score(text),
+        "dense_text_score": min(len(words) / 8.0, 3.0) + min(length / 80.0, 2.0),
+    }
+
+
+def complexity_score(text: str) -> float:
+    f = compute_features(text)
+    score = 0.0
+    score += min(f["marathi_digit_count"], 12) * 0.35
+    score += min(f["slash_count"], 6) * 0.6
+    score += min(f["period_count"], 10) * 0.2
+    score += min(f["hyphen_count"] + f["dash_count"], 6) * 0.35
+    score += min(f["comma_count"] + f["colon_count"], 8) * 0.15
+    score += min(f["bracket_count"], 6) * 0.25
+    score += min(f["currency_count"] + f["percent_count"], 4) * 0.5
+    score += min(f["conjunct_estimate"], 15) * 0.12
+    score += f["matra_score"]
+    score += f["reference_pattern_score"]
+    score += f["dense_text_score"]
+    score += f["special_character_density"] * 8
+    score += f["numeric_density"] * 6
+    score -= f["ascii_digit_count"] * 0.5
+    return round(score, 4)
+
+
+def visual_complexity_score(
+    *,
+    width: int = 0,
+    height: int = 0,
+    aspect_ratio: float = 0.0,
+    cheap_ocr_text: str = "",
+) -> float:
+    """Lane-assignment score when PDF text layer is missing (scanned docs)."""
+    score = 0.0
+    if aspect_ratio >= 4.0:
+        score += 1.5
+    if width >= 1200:
+        score += 0.8
+    if 40 <= height <= 180:
+        score += 1.0
+    if cheap_ocr_text.strip():
+        score += complexity_score(cheap_ocr_text) * 0.85
+    else:
+        # Unknown content — mild prior for line-like crops
+        score += 1.2
+    return round(score, 4)
+
+
+def word_count(text: str) -> int:
+    return len([w for w in re.split(r"\s+", (text or "").strip()) if w])
+
+
+def is_too_long(
+    text: str,
+    max_words: int = 50,
+    *,
+    max_chars: int | None = None,
+) -> bool:
+    if word_count(text) > max_words:
+        return True
+    if max_chars is not None and char_count(text) > max_chars:
+        return True
+    return False
+
+
+def is_trivial(
+    text: str,
+    *,
+    min_words: int = 2,
+    max_words: int = 50,
+    min_chars: int | None = None,
+    max_chars: int | None = None,
+) -> bool:
+    t = (text or "").strip()
+    n_chars = char_count(t)
+    floor = 8 if min_chars is None else min_chars
+    if n_chars < floor:
+        return True
+    if not in_char_band(t, min_chars, max_chars):
+        return True
+    words = [w for w in re.split(r"\s+", t) if w]
+    if len(words) < min_words:
+        return True
+    if len(words) > max_words:
+        return True
+    if len(words) <= 1 and complexity_score(t) < 2.5:
+        return True
+    for pat in TRIVIAL_REJECT:
+        if pat.search(t):
+            return True
+    return False
+
+
+def is_ordinary_prose(text: str) -> bool:
+    """True if text is ordinary Marathi — not OCR-hard-symbol selected."""
+    t = unicodedata.normalize("NFC", (text or "").strip())
+    if not t:
+        return False
+    f = compute_features(t)
+    if f["marathi_digit_count"] or f["ascii_digit_count"]:
+        return False
+    if f["currency_count"] or f["percent_count"]:
+        return False
+    if f["reference_pattern_score"] > 0:
+        return False
+    if f["slash_count"] > 0 or SLASH_ID_RE.search(t):
+        return False
+    if HARD_SYMBOL_RE.search(t):
+        return False
+    # Allow light prose punctuation (. , ।) but not dense hard specials
+    hardish = f["slash_count"] + f["colon_count"] + f["semicolon_count"] + f["bracket_count"]
+    hardish += f["hyphen_count"] + f["dash_count"] + f["currency_count"] + f["percent_count"]
+    if hardish > 2:
+        return False
+    if f["special_character_density"] > 0.06:
+        return False
+    return True
+
+
+def classify_difficulty(
+    text: str,
+    *,
+    min_hard_score: float = 3.0,
+    max_normal_score: float = 2.5,
+    min_words: int = 2,
+    max_words: int = 50,
+    normal_min_words: int = 6,
+    normal_max_words: int = 40,
+    min_chars: int | None = None,
+    max_chars: int | None = None,
+    allow_ascii_digits: bool = False,
+    score_override: float | None = None,
+) -> dict[str, Any]:
+    """Assign hard | normal | reject with reasons."""
+    scored = score_candidate(
+        text,
+        min_words=min_words,
+        max_words=max_words,
+        min_chars=min_chars,
+        max_chars=max_chars,
+    )
+    if score_override is not None:
+        scored["complexity_score"] = score_override
+    f = scored["features"]
+    reasons: list[str] = []
+
+    if not allow_ascii_digits and f["ascii_digit_count"] > 0:
+        return {
+            **scored,
+            "difficulty": "reject",
+            "reject_reasons": ["ascii_digits"],
+        }
+    if scored["is_trivial"] or scored.get("is_too_long"):
+        return {
+            **scored,
+            "difficulty": "reject",
+            "reject_reasons": ["trivial_or_too_long"],
+        }
+
+    wc = scored["word_count"]
+    score = scored["complexity_score"]
+
+    # Normal first: ordinary Marathi prose must not be taken for hard-symbol reasons
+    if (
+        is_ordinary_prose(text)
+        and normal_min_words <= wc <= normal_max_words
+    ):
+        # Cap displayed score for normal lane reporting; keep features intact
+        return {
+            **scored,
+            "complexity_score": min(score, max_normal_score),
+            "difficulty": "normal",
+            "reject_reasons": [],
+        }
+
+    # Hard lane: refs / numerals / hard punctuation / high complexity with hard signals
+    hard_signal = (
+        f["reference_pattern_score"] > 0
+        or f["marathi_digit_count"] > 0
+        or f["slash_count"] > 0
+        or f["currency_count"] > 0
+        or f["percent_count"] > 0
+        or f["symbol_count"] >= 3
+        or score >= min_hard_score
+    )
+    if hard_signal and score >= min_hard_score:
+        return {**scored, "difficulty": "hard", "reject_reasons": []}
+    if hard_signal and (
+        f["reference_pattern_score"] > 0
+        or f["marathi_digit_count"] > 0
+        or f["slash_count"] > 0
+    ):
+        return {**scored, "difficulty": "hard", "reject_reasons": []}
+
+    reasons.append("neither_hard_nor_ordinary_prose")
+    return {**scored, "difficulty": "reject", "reject_reasons": reasons}
+
+
+def score_candidate(
+    text: str,
+    *,
+    min_words: int = 2,
+    max_words: int = 50,
+    min_chars: int | None = None,
+    max_chars: int | None = None,
+) -> dict[str, Any]:
+    features = compute_features(text)
+    score = complexity_score(text)
+    too_long = is_too_long(text, max_words=max_words, max_chars=max_chars)
+    trivial = is_trivial(
+        text,
+        min_words=min_words,
+        max_words=max_words,
+        min_chars=min_chars,
+        max_chars=max_chars,
+    )
+    n_chars = char_count(text)
+    return {
+        "complexity_score": score,
+        "features": features,
+        "word_count": features["word_count"],
+        "char_count": n_chars,
+        "is_too_long": too_long,
+        "is_trivial": trivial or too_long,
+        "contains_marathi_numerals": features["marathi_digit_count"] > 0,
+        "contains_special_chars": features["symbol_count"] > 0,
+        "contains_reference_identifier": features["reference_pattern_score"] > 0,
+        "contains_conjuncts": features["conjunct_estimate"] > 0,
+    }

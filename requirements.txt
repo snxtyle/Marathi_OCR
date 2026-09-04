@@ -1,0 +1,16 @@
+# Core pipeline
+pymupdf>=1.24.0
+Pillow>=10.0.0
+PyYAML>=6.0
+imagehash>=4.3.1
+numpy>=1.24.0
+rapidfuzz>=3.0.0
+streamlit>=1.28.0
+requests>=2.31.0
+tqdm>=4.66.0
+typing_extensions>=4.8.0
+
+# OCR: system `tesseract` + mar traineddata (default / bakeoff baseline)
+# Optional bakeoff backends:
+#   pip install paddleocr paddlepaddle
+#   pip install surya-ocr torch   # may need llama.cpp for recent Surya
