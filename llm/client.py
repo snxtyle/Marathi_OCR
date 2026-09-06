@@ -166,8 +166,10 @@ class LLMClient:
             "Prefer direct .pdf links on official .gov.in domains "
             "(gr.maharashtra.gov.in, maharashtra.gov.in, lj.maharashtra.gov.in, etc.). "
             "Reject blogs, blogs mirrors, paywalled, and non-PDF pages. "
-            "Return diverse, downloadable PDF URLs useful for hard Devanagari OCR "
-            "(references, Marathi numerals, dense punctuation). "
+            "Return diverse, downloadable PDF URLs useful for hard Devanagari OCR: "
+            "documents likely to contain Marathi numerals, dense punctuation, "
+            "file/reference-style identifiers, mixed special characters "
+            "(judge usefulness in natural language — no fixed keyword checklist). "
             "Respond with JSON only: "
             '{"queries":["..."],"pdf_urls":["https://...pdf"],"notes":"..."}'
         )
@@ -179,7 +181,8 @@ class LLMClient:
                     "Marathi language body text preferred",
                     "public PDF only with direct .pdf URL when possible",
                     "government / official Maharashtra sources preferred",
-                    "hard OCR value: refs like प्र.क्र., numerals ०-९, punctuation",
+                    "hard OCR value: Marathi numerals ०-९, dense punctuation, "
+                    "identifier-like strings (illustrative KIND only, not required phrases)",
                 ],
             },
             ensure_ascii=False,
@@ -253,9 +256,10 @@ class LLMClient:
             ]
 
         system = (
-            "Rank PDF candidates for building a hard Marathi OCR dataset "
-            "(refs, Marathi numerals, dense punctuation, Devanagari). "
-            "Prefer official .gov.in PDFs. "
+            "Rank PDF candidates for building a hard Marathi OCR dataset. "
+            "Prefer official .gov.in PDFs likely to yield OCR-hard crops: "
+            "Marathi numerals, dense punctuation, mixed identifiers/specials "
+            "(natural-language judgment — not a fixed keyword list). "
             "Respond JSON only: "
             '{"ranked":[{"url":"...","score":0.0-1.0,"reason":"..."}]}'
         )
@@ -312,13 +316,20 @@ class LLMClient:
         *,
         ocr_prediction: str = "",
         context: dict[str, Any] | None = None,
+        intended_lane: str = "",
     ) -> dict[str, Any]:
-        """Compare crop pixels to candidate text for exact correctness.
+        """Vision end-gate: image↔text exactness AND OCR-hardness judgment.
 
-        Does NOT invent/rewrite ground truth. Flags mismatches for human review.
+        Does NOT invent/rewrite ground truth. Flags mismatches for review/reject.
+        Complexity is judged from image+text in natural language — not keyword lists.
         Falls back to text-only semantic check if vision is rejected by the API.
         """
         path = Path(image_path)
+        soft_complexity = {
+            "is_complex_for_ocr": None,
+            "suggested_lane": None,
+            "complexity_notes": "",
+        }
         if not self.enabled:
             return {
                 "enabled": False,
@@ -329,6 +340,7 @@ class LLMClient:
                 "confidence": 0.0,
                 "notes": "llm_disabled",
                 "mode": "disabled",
+                **soft_complexity,
             }
         if not path.is_file():
             return {
@@ -341,24 +353,40 @@ class LLMClient:
                 "notes": "missing_image",
                 "mode": "vision",
                 "error": f"missing_image:{path}",
+                **soft_complexity,
             }
 
         system = (
-            "You are a precise Marathi OCR verifier. You SEE the crop image and a "
-            "candidate text string. Decide whether the candidate text is an EXACT "
-            "transcription of the visible text (character-level precision). "
-            "Rules:\n"
+            "You are a precise Marathi OCR dataset validator. You SEE the crop image "
+            "and a candidate text string. Make TWO judgments:\n\n"
+            "1) EXACT MATCH — Is candidate_text an EXACT transcription of the visible "
+            "text (character-level precision)?\n"
             "- Exact means every Devanagari character, Marathi numeral (०-९), "
             "punctuation (/ . , - () : ;), and spacing matches the image.\n"
             "- Flag ASCII digits if the image shows Marathi digits.\n"
-            "- Flag missing/extra matras, conjuncts, or reference tokens.\n"
-            "- Do NOT invent or rewrite ground truth. Only judge the given candidate.\n"
+            "- Flag missing/extra matras, conjuncts, or tokens.\n"
+            "- Do NOT invent or rewrite ground truth. Only judge the given candidate.\n\n"
+            "2) OCR COMPLEXITY — Is this sample genuinely HARD for OCR and suitable "
+            "for an ~80% hard validation pack?\n"
+            "- Hard means the visible text would challenge OCR: Marathi digits, dense "
+            "punctuation, slashes/hyphens in identifiers, mixed special characters, "
+            "currency/percent, dense conjuncts/matras, or similar structural difficulty.\n"
+            "- Ordinary flowing Marathi prose without those challenges → suggested_lane "
+            '"normal" (is_complex_for_ocr=false).\n'
+            "- Too trivial / garbage / unreadable → suggested_lane \"reject\".\n"
+            "- A lone slash in an office/job title list is NOT automatically hard.\n"
+            "- Judge from structural OCR difficulty you see (numerals, dense "
+            "punctuation, identifier-like digit+separator clusters, currency, "
+            "dense conjuncts); do NOT require any fixed keyword/template list.\n\n"
             "Respond with JSON only:\n"
             "{"
             '"exact_match": true/false, '
             '"visible_differs": true/false, '
             '"diff_spans": ["short quotes of mismatches"], '
             '"likely_ocr_errors": ["..."], '
+            '"is_complex_for_ocr": true/false, '
+            '"suggested_lane": "hard"|"normal"|"reject", '
+            '"complexity_notes": "short reason", '
             '"suspicious": true/false, '
             '"confidence": 0.0-1.0, '
             '"notes": "short reason"'
@@ -377,15 +405,18 @@ class LLMClient:
                 "notes": "image_encode_failed",
                 "mode": "vision",
                 "error": str(exc),
+                **soft_complexity,
             }
 
         user_payload = {
             "candidate_text": candidate_text,
             "ocr_prediction": ocr_prediction,
             "context": context or {},
+            "intended_lane": intended_lane or None,
             "instruction": (
-                "Look at the image carefully. Is candidate_text an exact match "
-                "to the text visible in the image?"
+                "Look at the image carefully. (1) Is candidate_text an exact match "
+                "to the text visible in the image? (2) Is this sample complex/hard "
+                "enough for the hard OCR validation pack?"
             ),
         }
         messages: list[dict[str, Any]] = [
@@ -425,6 +456,7 @@ class LLMClient:
                 "notes": "llm_call_failed_soft_pass",
                 "mode": "vision",
                 "error": result.get("error"),
+                **soft_complexity,
             }
 
         parsed = _extract_json(result.get("content", "")) or {}
@@ -440,6 +472,20 @@ class LLMClient:
         if exact and not parsed.get("suspicious") and not parsed.get("visible_differs"):
             suspicious = False
 
+        lane_raw = str(parsed.get("suggested_lane") or "").strip().lower()
+        if lane_raw not in {"hard", "normal", "reject"}:
+            if parsed.get("is_complex_for_ocr") is True:
+                lane_raw = "hard"
+            elif parsed.get("is_complex_for_ocr") is False:
+                lane_raw = "normal"
+            else:
+                lane_raw = ""
+        is_complex = parsed.get("is_complex_for_ocr")
+        if is_complex is None and lane_raw:
+            is_complex = lane_raw == "hard"
+        elif is_complex is not None:
+            is_complex = bool(is_complex)
+
         return {
             "enabled": True,
             "ok": True,
@@ -448,6 +494,10 @@ class LLMClient:
             "visible_differs": bool(parsed.get("visible_differs", not exact)),
             "diff_spans": list(parsed.get("diff_spans") or []),
             "likely_ocr_errors": list(parsed.get("likely_ocr_errors") or []),
+            "is_complex_for_ocr": is_complex,
+            "suggested_lane": lane_raw or None,
+            "ocr_complexity": lane_raw or None,
+            "complexity_notes": str(parsed.get("complexity_notes") or ""),
             "suspicious": suspicious,
             "confidence": float(parsed.get("confidence") or 0.0),
             "notes": str(parsed.get("notes") or ""),
@@ -473,22 +523,31 @@ class LLMClient:
                 "nonsense_tokens": [],
                 "punctuation_issues": [],
                 "likely_ocr_garble": False,
+                "is_complex_for_ocr": None,
+                "suggested_lane": None,
+                "complexity_notes": "",
                 "confidence": 0.0,
                 "notes": "llm_disabled",
                 "mode": "text",
             }
 
         system = (
-            "You validate Marathi OCR candidate text for linguistic plausibility only. "
-            "You cannot see the image. Do NOT invent or rewrite ground truth. "
-            "Check: real Marathi words vs character soup; odd punctuation; OCR garble; "
-            "government-reference style is OK. "
-            "Respond with JSON only:\n"
+            "You validate Marathi OCR candidate text for linguistic plausibility and "
+            "OCR-hardness (text-only fallback; you cannot see the image). "
+            "Do NOT invent or rewrite ground truth. "
+            "Check: real Marathi words vs character soup; odd punctuation; OCR garble. "
+            "Also suggest hard vs normal: hard = digits, dense punctuation, "
+            "identifier-like digit+separator strings, specials, dense conjuncts; "
+            "normal = ordinary flowing prose. A lone title slash is not automatically hard. "
+            "No fixed keyword checklist. Respond with JSON only:\n"
             "{"
             '"is_plausible_marathi": true/false, '
             '"nonsense_tokens": ["..."], '
             '"punctuation_issues": ["..."], '
             '"likely_ocr_garble": true/false, '
+            '"is_complex_for_ocr": true/false, '
+            '"suggested_lane": "hard"|"normal"|"reject", '
+            '"complexity_notes": "short reason", '
             '"suspicious": true/false, '
             '"confidence": 0.0-1.0, '
             '"notes": "short reason"'
@@ -517,6 +576,9 @@ class LLMClient:
                 "nonsense_tokens": [],
                 "punctuation_issues": [],
                 "likely_ocr_garble": False,
+                "is_complex_for_ocr": None,
+                "suggested_lane": None,
+                "complexity_notes": "",
                 "confidence": 0.0,
                 "notes": "llm_call_failed_soft_pass",
                 "mode": "text",
@@ -529,6 +591,14 @@ class LLMClient:
             or (parsed.get("is_plausible_marathi") is False)
             or parsed.get("nonsense_tokens")
         )
+        lane_raw = str(parsed.get("suggested_lane") or "").strip().lower()
+        if lane_raw not in {"hard", "normal", "reject"}:
+            lane_raw = ""
+        is_complex = parsed.get("is_complex_for_ocr")
+        if is_complex is None and lane_raw:
+            is_complex = lane_raw == "hard"
+        elif is_complex is not None:
+            is_complex = bool(is_complex)
         return {
             "enabled": True,
             "ok": True,
@@ -537,6 +607,10 @@ class LLMClient:
             "nonsense_tokens": list(parsed.get("nonsense_tokens") or []),
             "punctuation_issues": list(parsed.get("punctuation_issues") or []),
             "likely_ocr_garble": bool(parsed.get("likely_ocr_garble", False)),
+            "is_complex_for_ocr": is_complex,
+            "suggested_lane": lane_raw or None,
+            "ocr_complexity": lane_raw or None,
+            "complexity_notes": str(parsed.get("complexity_notes") or ""),
             "suspicious": suspicious,
             "confidence": float(parsed.get("confidence") or 0.0),
             "notes": str(parsed.get("notes") or ""),

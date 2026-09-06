@@ -30,12 +30,14 @@ SEED_PORTALS = [
 ]
 
 # Built-in web-search seeds — user never needs to pass --query
+# These are discovery queries (not hardness classifiers / allowlists).
 DEFAULT_SEARCH_SEEDS = [
     "महाराष्ट्र शासन निर्णय मराठी filetype:pdf",
+    "शासन परिपत्रक क्रमांक मराठी filetype:pdf",
+    "site:gr.maharashtra.gov.in शासन निर्णय मराठी filetype:pdf",
     "महाराष्ट्र अधिसूचना मराठी filetype:pdf",
-    "महाराष्ट्र परिपत्रक मराठी filetype:pdf",
-    "maharashtra government resolution marathi filetype:pdf",
-    "site:gr.maharashtra.gov.in मराठी filetype:pdf",
+    "maharashtra government resolution Marathi Devanagari filetype:pdf",
+    "महाराष्ट्र राजपत्र मराठी अंक filetype:pdf",
 ]
 
 PDF_HREF_RE = re.compile(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', re.IGNORECASE)

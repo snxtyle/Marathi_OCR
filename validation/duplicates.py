@@ -21,6 +21,34 @@ def text_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, na, nb).ratio()
 
 
+def prefix_twin_score(a: str, b: str) -> float:
+    """High score when one normalized string is nearly a prefix of the other.
+
+    Catches truncated twins (e.g. internship line cut mid-sentence) that
+    SequenceMatcher alone may under-score.
+    """
+    na, nb = normalize_text(a), normalize_text(b)
+    if not na or not nb:
+        return 0.0
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(shorter) < 16:
+        return text_similarity(a, b)
+    if longer.startswith(shorter):
+        return len(shorter) / max(len(longer), 1)
+    n = 0
+    for ca, cb in zip(shorter, longer):
+        if ca != cb:
+            break
+        n += 1
+    if n >= 24 and n / len(shorter) >= 0.88:
+        return n / max(len(longer), 1)
+    return 0.0
+
+
+def combined_text_similarity(a: str, b: str) -> float:
+    return max(text_similarity(a, b), prefix_twin_score(a, b))
+
+
 def _bbox_iou(a: list[float], b: list[float]) -> float:
     if len(a) < 4 or len(b) < 4:
         return 0.0
@@ -71,13 +99,56 @@ def find_duplicate_texts(
     threshold: float = 0.92,
 ) -> list[tuple[Any, Any, float]]:
     pairs: list[tuple[Any, Any, float]] = []
-    texts = [(r.get("id", i), r.get(text_key, "")) for i, r in enumerate(records)]
+    texts = [
+        (r.get("id", i), r.get(text_key) or r.get("text_assist") or "")
+        for i, r in enumerate(records)
+    ]
     for i, (ida, ta) in enumerate(texts):
         for idb, tb in texts[:i]:
-            sim = text_similarity(ta, tb)
+            sim = combined_text_similarity(ta, tb)
             if sim >= threshold:
                 pairs.append((idb, ida, round(sim, 4)))
     return pairs
+
+
+def drop_near_duplicate_texts(
+    records: list[dict[str, Any]],
+    *,
+    text_key: str = "expected_text",
+    threshold: float = 0.92,
+    prefer_key: str = "complexity_score",
+    cross_source: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Drop near-duplicate / prefix-twin labels; keep higher prefer_key (then longer text)."""
+    ordered = sorted(
+        records,
+        key=lambda r: (
+            float(r.get(prefer_key) or 0),
+            len(str(r.get(text_key) or r.get("text_assist") or "")),
+        ),
+        reverse=True,
+    )
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for rec in ordered:
+        text = rec.get(text_key) or rec.get("text_assist") or rec.get("expected_text") or ""
+        twin = False
+        for prev in kept:
+            if not cross_source and prev.get("source_id") != rec.get("source_id"):
+                continue
+            prev_text = (
+                prev.get(text_key) or prev.get("text_assist") or prev.get("expected_text") or ""
+            )
+            if combined_text_similarity(text, prev_text) >= threshold:
+                twin = True
+                break
+        if twin:
+            dropped += 1
+            continue
+        kept.append(rec)
+    kept_ids = {str(r.get("id")) for r in kept}
+    restored = [r for r in records if str(r.get("id")) in kept_ids]
+    return restored, {"input": len(records), "dropped": dropped, "kept": len(restored)}
 
 
 def candidate_dedup_before_ocr(
@@ -97,7 +168,6 @@ def candidate_dedup_before_ocr(
         "kept": 0,
     }
 
-    # Same source page + high IoU bbox
     for i, a in enumerate(records):
         if a.get("id") in drop_ids:
             continue
@@ -115,7 +185,6 @@ def candidate_dedup_before_ocr(
                 stats["same_bbox"] += 1
                 break
 
-    # Image sha / phash among records that already have files
     path_by_id: dict[str, str] = {}
     for r in records:
         rid = str(r.get("id"))
@@ -123,7 +192,6 @@ def candidate_dedup_before_ocr(
             continue
         p = r.get("image_path") or ""
         if not p:
-            # relative image_filename may exist after crop
             from pathlib import Path
 
             root = Path(__file__).resolve().parents[1]
@@ -147,9 +215,6 @@ def candidate_dedup_before_ocr(
                     drop_ids.add(rid)
                     stats["exact_image"] += 1
         for pa, pb, _d in dups["near_phash_pairs"]:
-            for rid in path_to_ids.get(pb, [])[1:] or path_to_ids.get(pb, []):
-                # drop the later of the pair
-                pass
             ids_a = path_to_ids.get(pa, [])
             ids_b = path_to_ids.get(pb, [])
             for rid in ids_b:
@@ -171,24 +236,24 @@ def post_review_text_dedup(
     text_key: str = "expected_text",
     threshold: float = 0.92,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Stage B: flag near-duplicate text; reject only if same source family (no new visual value)."""
+    """Stage B: drop near-duplicate / prefix-twin text (cross-source)."""
+    kept, stats = drop_near_duplicate_texts(
+        records,
+        text_key=text_key,
+        threshold=threshold,
+        prefer_key="complexity_score",
+        cross_source=True,
+    )
     pairs = find_duplicate_texts(records, text_key=text_key, threshold=threshold)
-    by_id = {str(r.get("id")): r for r in records}
-    flagged: list[dict[str, Any]] = []
-    drop: set[str] = set()
-    for ida, idb, sim in pairs:
-        a, b = by_id.get(str(ida)), by_id.get(str(idb))
-        if not a or not b:
-            continue
-        entry = {
-            "id_a": ida,
-            "id_b": idb,
+    flagged = [
+        {
+            "id_a": a,
+            "id_b": b,
             "similarity": sim,
-            "same_source": a.get("source_id") == b.get("source_id"),
+            "dropped": True,
         }
-        flagged.append(entry)
-        # Reject only when same source_id (header/footer repeats) — keep cross-doc same text
-        if a.get("source_id") == b.get("source_id"):
-            drop.add(str(idb))
-    kept = [r for r in records if str(r.get("id")) not in drop]
+        for a, b, sim in pairs
+    ]
+    # Attach drop count for callers that only use flagged list length
+    _ = stats
     return kept, flagged

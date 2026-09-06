@@ -90,20 +90,36 @@ def download_many(
     *,
     max_docs: int = 20,
     delay_s: float = 1.0,
+    skip_urls: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Download until ``max_docs`` successful PDFs or URL list exhausted.
+
+    Failed / skipped / already-seen hashes do not count toward the success quota,
+    so callers actually get up to ``max_docs`` new files when the pool allows.
+    """
     results: list[dict[str, Any]] = []
     seen_hash: set[str] = set()
+    skip = {u.strip().lower() for u in (skip_urls or set()) if u}
+    ok_new = 0
     i = 0
     for url in urls:
-        if len(results) >= max_docs:
+        if ok_new >= max_docs:
             break
         i += 1
+        if url.strip().lower() in skip:
+            results.append({"ok": False, "url": url, "skipped": True, "error": "already_ingested"})
+            continue
         try:
             meta = download_pdf(url, dest_dir, index=i)
-            if meta["sha256"] in seen_hash:
+            if meta["sha256"] in seen_hash or meta.get("deduped"):
+                meta["ok"] = True
                 meta["deduped"] = True
+                results.append(meta)
+                # Deduped against prior download — not a new doc for this batch
+                continue
             seen_hash.add(meta["sha256"])
             results.append(meta)
+            ok_new += 1
             logger.info("Downloaded %s -> %s (%s bytes)", url, meta["path"], meta["bytes"])
         except Exception as exc:  # noqa: BLE001
             logger.warning("Download failed %s: %s", url, exc)

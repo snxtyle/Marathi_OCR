@@ -2,6 +2,10 @@
 
 Order: quality threshold → source diversity → difficulty → quota.
 Never pad shortfalls with weak samples — report e.g. 73/80.
+
+Hard vs normal uses generic heuristic provisional labels (digits / punctuation
+density / conjuncts) — never GR keyword lists. Final lane confirmation is the
+vision LLM end-gate in validate + auto_accept.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from pipeline.io_utils import read_jsonl, write_json, write_jsonl
 from pipeline.logging_setup import setup_logging
 from pipeline.profiles import get_active_profile
 from scoring.complexity import classify_difficulty, is_ordinary_prose
-from validation.duplicates import candidate_dedup_before_ocr
+from validation.duplicates import candidate_dedup_before_ocr, drop_near_duplicate_texts
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +48,6 @@ def _select_lane(
     skipped_quality = 0
     skipped_diversity = 0
 
-    # Sort hard by complexity desc; normal by length then score
     if require_ordinary:
         pool = sorted(
             records,
@@ -86,14 +89,22 @@ def _select_lane(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Select source-diverse 80 hard + 20 normal")
+    parser = argparse.ArgumentParser(description="Select source-diverse hard + normal lanes")
     parser.add_argument("--input", default="", help="JSONL input (default candidates_scored/candidates)")
+    parser.add_argument("--hard-count", type=int, default=None, help="Override hard lane target")
+    parser.add_argument("--normal-count", type=int, default=None, help="Override normal lane target")
     args = parser.parse_args()
     cfg = load_config()
     setup_logging(cfg)
     profile = get_active_profile(cfg)
-    hard_target = int(profile.get("hard_count") or cfg.get("validation_hard_count", 80))
-    normal_target = int(profile.get("normal_count") or cfg.get("validation_normal_count", 20))
+    from pipeline.quotas import scale_lane_targets
+
+    hard_target, normal_target = scale_lane_targets(
+        hard_count=args.hard_count,
+        normal_count=args.normal_count,
+        profile=profile,
+        cfg=cfg,
+    )
     max_per = int(profile.get("max_samples_per_source", 5))
     min_hard = float(cfg.get("min_complexity_score", 3.0))
 
@@ -103,32 +114,55 @@ def main() -> None:
         in_path = cand_dir / "candidates.jsonl"
     records = read_jsonl(in_path)
 
-    # Ensure difficulty labels
     allow_ascii = bool(profile.get("allow_ascii_digits", False))
+    normal_min_words = int(cfg.get("normal_min_words", 6))
+    normal_max_words = int(cfg.get("normal_max_words", 40))
     labeled = []
     for rec in records:
-        text = rec.get("text_assist") or rec.get("expected_text") or ""
-        if not rec.get("difficulty"):
-            c = classify_difficulty(text, allow_ascii_digits=allow_ascii, min_hard_score=min_hard)
-            rec["difficulty"] = c["difficulty"]
-            rec["complexity_score"] = c["complexity_score"]
-            rec["features"] = c.get("features", rec.get("features"))
+        text = rec.get("text_assist") or rec.get("expected_text") or rec.get("ocr_prediction") or ""
+        c = classify_difficulty(
+            text,
+            allow_ascii_digits=allow_ascii,
+            min_hard_score=min_hard,
+            normal_min_words=normal_min_words,
+            normal_max_words=normal_max_words,
+        )
+        rec["difficulty"] = c["difficulty"]
+        rec["complexity_score"] = c["complexity_score"]
+        rec["features"] = c.get("features", rec.get("features"))
+        rec["hard_signal_source"] = c.get("hard_signal_source")
+        rec["contains_marathi_numerals"] = c.get("contains_marathi_numerals")
+        rec["contains_reference_identifier"] = c.get("contains_reference_identifier")
         if rec.get("difficulty") in {"hard", "normal"}:
             labeled.append(rec)
 
-    # Stage A dedup (bbox / image) before selection
     labeled, dedup_stats = candidate_dedup_before_ocr(
         labeled,
         phash_max_distance=int(cfg.get("perceptual_hash_max_distance", 8)),
     )
+    # Text near-dup / prefix twins before selection
+    labeled, text_dedup_stats = drop_near_duplicate_texts(
+        labeled,
+        text_key="text_assist",
+        threshold=float(cfg.get("text_near_duplicate_threshold", 0.92)),
+        prefer_key="complexity_score",
+    )
 
     hard_pool = [r for r in labeled if r.get("difficulty") == "hard"]
+    hard_pool = sorted(
+        hard_pool,
+        key=lambda r: (
+            1 if r.get("contains_marathi_numerals") else 0,
+            float((r.get("features") or {}).get("identifier_likeness_score") or 0),
+            float(r.get("complexity_score") or 0),
+        ),
+        reverse=True,
+    )
     normal_pool = [r for r in labeled if r.get("difficulty") == "normal"]
 
     hard_sel, hard_stats = _select_lane(
         hard_pool, target=hard_target, max_per_source=max_per, min_score=min_hard
     )
-    # Prefer sources not already heavy in hard set for normal; share global source caps
     hard_sources = {r.get("source_id") for r in hard_sel}
     normal_sorted = sorted(
         normal_pool,
@@ -150,8 +184,9 @@ def main() -> None:
         "hard": hard_stats,
         "normal": normal_stats,
         "dedup_before_ocr": dedup_stats,
+        "text_near_dedup": text_dedup_stats,
         "quota_met": hard_stats["selected"] >= hard_target and normal_stats["selected"] >= normal_target,
-        "note": "shortfall is never padded with weak samples",
+        "note": "shortfall is never padded with weak samples; hard is heuristic-provisional until LLM end-gate",
     }
     write_json(cand_dir / "selection_report.json", report)
     print(

@@ -11,10 +11,10 @@ ocr_cache_dir: data/cache/ocr
 render_dpi: 300
 hard_crop_dpi: 600
 
-min_width: 800
-min_height: 100
+min_width: 400
+min_height: 40
 max_crop_height: 220
-min_aspect_ratio: 4.0
+min_aspect_ratio: 2.5
 
 # Active dataset profile (numeral policy is profile-scoped, not factory-global)
 active_profile: marathi_hard_validation
@@ -22,7 +22,9 @@ active_profile: marathi_hard_validation
 profiles:
   marathi_hard_validation:
     allow_ascii_digits: false
-    require_marathi_digit_cases: true
+    # Soft ranking preference only — NOT a keyword/ref hard gate.
+    # Final hard confirmation is LLM vision (exact match + complexity).
+    require_marathi_digit_cases: false
     hard_count: 80
     normal_count: 20
     max_samples_per_source: 8
@@ -38,6 +40,7 @@ profiles:
     allow_english_text: true
 
 # Scoring: auto | text | visual (scanned PDFs without text layer)
+# Heuristic scores are a cheap prefilter; LLM vision is the product end-gate.
 scoring_mode: auto
 min_complexity_score: 3.0
 # Normal lane: ordinary prose — not selected for OCR-hard symbols
@@ -59,23 +62,30 @@ duplicate_threshold: 0.95
 text_near_duplicate_threshold: 0.92
 perceptual_hash_max_distance: 8
 
-# Discovery — crawl-first; built-in seeds (user never passes a query)
+# Discovery — crawl-first; seeds find hard-rich docs (search queries, not classifiers)
 discover_mode: crawl_first
 llm_discover_rank: true
 use_ddg_by_default: true
 discover_search_seeds:
   - "महाराष्ट्र शासन निर्णय मराठी filetype:pdf"
+  - "शासन परिपत्रक क्रमांक मराठी filetype:pdf"
+  - "site:gr.maharashtra.gov.in शासन निर्णय मराठी filetype:pdf"
   - "महाराष्ट्र अधिसूचना मराठी filetype:pdf"
-  - "महाराष्ट्र परिपत्रक मराठी filetype:pdf"
-  - "maharashtra government resolution marathi filetype:pdf"
-  - "site:gr.maharashtra.gov.in मराठी filetype:pdf"
+  - "maharashtra government resolution Marathi Devanagari filetype:pdf"
+  - "महाराष्ट्र राजपत्र मराठी अंक filetype:pdf"
 
 # Validation export package (inside data/)
 validation_export_dir: data/export/marathi_ocr_validation_100
 validation_hard_count: 80
 validation_normal_count: 20
 
-# LLM — optional vision QA + optional discover rank
+# Mining loop (--target-count): grow discovery until hard+normal quotas filled
+pipeline_max_rounds: 8
+pipeline_docs_per_round: 12
+pipeline_docs_growth: 12
+pipeline_max_docs_cap: 200
+
+# LLM — vision QA: image↔text exactness + complexity (primary hard gate)
 llm_enabled: true
 llm_api_url: ""
 llm_api_key: ""
@@ -83,6 +93,8 @@ llm_model: "kimi-k3"
 llm_validate_parallel_workers: 2
 llm_discover_enabled: true
 llm_vision_validate: true
+# When LLM runs, hard lane requires is_complex_for_ocr (auto_accept demotes otherwise)
+llm_require_complex_for_hard: true
 
 review_required: false
 auto_accept: true

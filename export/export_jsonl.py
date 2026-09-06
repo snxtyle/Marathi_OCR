@@ -7,7 +7,7 @@ from typing import Any
 
 from pipeline.io_utils import write_json, write_jsonl
 from pipeline.splits import classify_issue_type, source_level_split
-from validation.duplicates import find_duplicate_images, find_duplicate_texts, post_review_text_dedup
+from validation.duplicates import find_duplicate_images
 from validation.numerals import has_ascii_digits
 
 
@@ -96,6 +96,7 @@ def export_validation_package(
     phash_max_distance: int = 8,
     text_sim_threshold: float = 0.92,
     project_root: Path | None = None,
+    require_llm_complex_for_hard: bool = True,
 ) -> dict[str, Any]:
     """Export Desktop marathi_ocr_validation_100 package with final QA gate."""
     import shutil
@@ -104,16 +105,44 @@ def export_validation_package(
     root = project_root or Path(__file__).resolve().parents[1]
 
     verified = [r for r in records if r.get("review_status") == "verified"]
-    # Soft text dedup: flag only (image-strict below). Do not drop for string match alone.
-    _kept_soft, text_flags = post_review_text_dedup(
-        verified, text_key="expected_text", threshold=text_sim_threshold
-    )
-    # Prefer flagged-but-kept inventory so quotas are not silently eaten by text soft policy
-    verified = verified
+
+    # Drop samples the LLM end-gate rejected for mismatch / not-complex (if still present)
+    llm_gated_out: list[dict[str, Any]] = []
+    llm_drop = 0
     for r in verified:
-        rid = str(r.get("id"))
-        if any(str(f.get("id_a")) == rid or str(f.get("id_b")) == rid for f in text_flags):
-            r["text_near_duplicate_flag"] = True
+        llm = (r.get("validation") or {}).get("llm") or {}
+        if llm and not llm.get("skipped") and llm.get("enabled", True):
+            if llm.get("exact_match") is False and r.get("gt_source") not in {
+                "auto_ocr_vision_corrected",
+                "auto_vision_match",
+            }:
+                llm_drop += 1
+                continue
+            if llm.get("suggested_lane") == "reject":
+                llm_drop += 1
+                continue
+            if (
+                require_llm_complex_for_hard
+                and r.get("difficulty") == "hard"
+                and llm.get("is_complex_for_ocr") is False
+            ):
+                # Should already be demoted in auto_accept; belt-and-suspenders
+                r = {**r, "difficulty": "normal", "hard_signal_source": "export_demoted_not_complex"}
+        llm_gated_out.append(r)
+    verified = llm_gated_out
+
+    # Text near-dup / prefix twins: drop globally (keep higher complexity)
+    from validation.duplicates import drop_near_duplicate_texts
+
+    thresh = max(0.88, text_sim_threshold - 0.04)
+    verified, text_drop_stats = drop_near_duplicate_texts(
+        verified,
+        text_key="expected_text",
+        threshold=thresh,
+        prefer_key="complexity_score",
+        cross_source=True,
+    )
+    text_flags: list[dict[str, Any]] = [{"dropped": True, "stats": text_drop_stats}]
 
     hard = [r for r in verified if r.get("difficulty") == "hard"]
     normal = [r for r in verified if r.get("difficulty") == "normal"]
@@ -145,6 +174,24 @@ def export_validation_package(
         return report
 
     selected = hard + normal
+    # Drop ASCII-digit GT under Marathi-digits-only profiles (OCR drift)
+    ascii_dropped = 0
+    if not allow_ascii_digits:
+        clean: list[dict[str, Any]] = []
+        for r in selected:
+            if has_ascii_digits(r.get("expected_text") or ""):
+                ascii_dropped += 1
+                continue
+            clean.append(r)
+        selected = clean
+        hard = [r for r in selected if r.get("difficulty") == "hard"]
+        normal = [r for r in selected if r.get("difficulty") == "normal"]
+        shortfall = {
+            "hard": f"{len(hard)}/{hard_target}",
+            "normal": f"{len(normal)}/{normal_target}",
+        }
+        quota_met = len(hard) >= hard_target and len(normal) >= normal_target
+
     # Image-strict dedup
     paths = []
     for r in selected:
@@ -155,6 +202,7 @@ def export_validation_package(
             paths.append(str(p))
             r["_resolved_image"] = str(p)
     img_dups = find_duplicate_images(paths, phash_max_distance=phash_max_distance)
+    # Remaining violations after drop (should be 0)
     ascii_violations = 0 if allow_ascii_digits else sum(
         1 for r in selected if has_ascii_digits(r.get("expected_text") or "")
     )
@@ -244,9 +292,11 @@ def export_validation_package(
         "quota_met": quota_met,
         "duplicate_samples": sum(len(g) - 1 for g in img_dups["exact_sha_groups"]),
         "near_duplicate_samples": len(img_dups["near_phash_pairs"]),
-        "text_near_duplicate_flags": len(text_flags),
+        "text_near_duplicate_flags": text_drop_stats.get("dropped", 0),
         "text_near_duplicates": text_flags[:50],
+        "text_near_dedup_stats": text_drop_stats,
         "arabic_digit_violations": ascii_violations,
+        "ascii_digit_dropped": ascii_dropped,
         "missing_images": missing,
         "empty_text": empty_text,
         "source_cap_violations": over_cap,
@@ -259,6 +309,7 @@ def export_validation_package(
         "image_text_mismatches": 0,
         "issue_type_counts": dict(issue_counts),
         "average_complexity_score": round(statistics.mean(scores), 4) if scores else 0.0,
+        "llm_gated_drops": llm_drop,
         "gate_ok": gate_ok,
         "export_path": str(out_dir),
         "public_lines": len(public),

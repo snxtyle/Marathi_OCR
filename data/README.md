@@ -21,6 +21,7 @@ Regenerate everything:
 
 ```bash
 .venv/bin/python3.12 -m scripts.run_pipeline --max-docs 8
+# or: .venv/bin/python3.12 -m scripts.run_pipeline --target-count 100
 ```
 
 Package output: `data/export/marathi_ocr_validation_100/`

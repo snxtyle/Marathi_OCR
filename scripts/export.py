@@ -36,12 +36,22 @@ def main() -> None:
         action="store_true",
         help="Allow draft export when hard/normal quotas are incomplete (never pads quality)",
     )
+    parser.add_argument("--hard-count", type=int, default=None, help="Override hard lane target")
+    parser.add_argument("--normal-count", type=int, default=None, help="Override normal lane target")
     parser.add_argument("--out", default="", help="Override output directory")
     args = parser.parse_args()
 
     cfg = load_config()
     setup_logging(cfg)
     profile = get_active_profile(cfg)
+    from pipeline.quotas import scale_lane_targets
+
+    hard_target, normal_target = scale_lane_targets(
+        hard_count=args.hard_count,
+        normal_count=args.normal_count,
+        profile=profile,
+        cfg=cfg,
+    )
     reviewed_dir = resolve_path(cfg, "reviewed")
     cand_dir = resolve_path(cfg, "candidates")
     final_dir = resolve_path(cfg, "final")
@@ -68,14 +78,17 @@ def main() -> None:
         report = export_validation_package(
             records,
             out,
-            hard_target=int(profile.get("hard_count", 80)),
-            normal_target=int(profile.get("normal_count", 20)),
+            hard_target=hard_target,
+            normal_target=normal_target,
             max_per_source=int(profile.get("max_samples_per_source", 5)),
             allow_ascii_digits=bool(profile.get("allow_ascii_digits", False)),
             allow_shortfall=bool(args.allow_shortfall),
             phash_max_distance=int(cfg.get("perceptual_hash_max_distance", 8)),
             text_sim_threshold=float(cfg.get("text_near_duplicate_threshold", 0.92)),
             project_root=ROOT,
+            require_llm_complex_for_hard=bool(
+                cfg.get("require_llm_complex_for_hard", cfg.get("llm_require_complex_for_hard", True))
+            ),
         )
         print(report)
         if report.get("export_blocked"):

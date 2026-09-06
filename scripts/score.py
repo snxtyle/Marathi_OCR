@@ -32,6 +32,10 @@ def main() -> None:
     setup_logging(cfg)
     profile = get_active_profile(cfg)
     allow_ascii = allow_ascii_digits(cfg)
+    # Visual-only crops without text cannot be LLM-confirmed yet — skip under hard profile
+    skip_visual_only = bool(profile.get("require_marathi_digit_cases", False)) or (
+        profile.get("_name") == "marathi_hard_validation"
+    )
     min_hard = float(args.min_score or cfg.get("min_complexity_score", 3.0))
     max_normal = float(cfg.get("normal_max_complexity_score", 2.5))
     min_words, max_words = resolve_word_limits(cfg, min_words=args.min_words, max_words=args.max_words)
@@ -53,13 +57,15 @@ def main() -> None:
                 ),
                 cheap_ocr_text=rec.get("ocr_prediction") or "",
             )
-            # Preserve visual-band candidates without PDF text for human GT
             if not text.strip():
+                if skip_visual_only:
+                    continue
                 rec.update(
                     {
                         "complexity_score": score_override,
                         "difficulty": "hard" if score_override >= min_hard else "normal",
                         "scoring_mode_used": "visual",
+                        "hard_signal_source": "visual_provisional",
                         "word_count": rec.get("word_count") or 0,
                         "char_count": rec.get("char_count") or 0,
                         "features": rec.get("features") or {"visual_score": score_override},
@@ -92,6 +98,7 @@ def main() -> None:
                 "word_count": classified["word_count"],
                 "char_count": classified["char_count"],
                 "difficulty": classified["difficulty"],
+                "hard_signal_source": classified.get("hard_signal_source"),
                 "scoring_mode_used": "visual" if use_visual else "text",
                 "word_limit": {"min": min_words, "max": max_words},
                 "char_limit": {"min": min_chars, "max": max_chars},

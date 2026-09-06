@@ -7,7 +7,11 @@ automated QA → export an **80% hard / 20% normal** dataset. No search query to
 No review UI required.
 
 ```bash
+# Default profile pack (80 hard + 20 normal)
 .venv/bin/python3.12 -m scripts.run_pipeline --max-docs 8
+
+# Request N high-quality samples — keeps mining until the quota is filled
+.venv/bin/python3.12 -m scripts.run_pipeline --target-count 1000
 ```
 
 ---
@@ -22,7 +26,7 @@ No review UI required.
 | Provenance | `…/metadata.json` |
 | QA report | `…/validation_report.json` |
 
-**Hard lane** — refs, Marathi numerals, dense punctuation, OCR-hard script.  
+**Hard lane** — refs, Marathi numerals, dense punctuation, OCR-hard script (LLM vision confirms).  
 **Normal lane** — ordinary Marathi prose (not “easy OCR”).  
 Selection is **quality → diversity → quota**. Shortfalls are reported; weak samples are never padded in.
 
@@ -41,10 +45,48 @@ pip install -r requirements.txt
 cp .env.example .env               # optional: LLM for discover-rank / vision QA
 # brew install tesseract && install `mar` traineddata
 
-.venv/bin/python3.12 -m scripts.run_pipeline --max-docs 8
+.venv/bin/python3.12 -m scripts.run_pipeline --target-count 100
 ```
 
 Open the package under `data/export/marathi_ocr_validation_100/`.
+
+---
+
+## Requesting N samples (`--target-count`)
+
+Pass **`--target-count N`** (alias: **`--samples`**) to keep discovering / extracting /
+validating until **N high-quality accepted** samples exist.
+
+| Flag | Behavior |
+|------|----------|
+| `--target-count 100` | 80 hard + 20 normal (profile ratio) |
+| `--target-count 1000` | 800 hard + 200 normal |
+| `--hard-count` / `--normal-count` | Override absolute lane sizes (or with `--target-count`, fix one lane and fill the other) |
+| `--allow-shortfall` | Draft export if sources run out (never pads weak samples). **Off by default when a target is set** |
+| `--max-rounds` | Safety cap on mine loops (default scales with N) |
+| `--max-docs` / `--docs-growth` / `--max-docs-cap` | Per-round discover budget, growth, and cumulative source cap |
+
+```bash
+# 1000 samples at the default 80/20 hard/normal ratio
+.venv/bin/python3.12 -m scripts.run_pipeline --target-count 1000
+
+# Same thing via alias
+.venv/bin/python3.12 -m scripts.run_pipeline --samples 1000
+
+# Explicit lane overrides
+.venv/bin/python3.12 -m scripts.run_pipeline --hard-count 800 --normal-count 200
+```
+
+**How ratio scales:** profile `hard_count` / `normal_count` (default **80 / 20**) are treated as a
+ratio. For target \(N\):
+
+\[
+\text{hard} = \mathrm{round}(N \times 80/100),\quad \text{normal} = N - \text{hard}
+\]
+
+So 100 → 80+20, 1000 → 800+200. Failures that miss quality gates are discarded; the
+orchestrator mines more documents until both lanes are filled, sources are exhausted, or
+`--max-docs-cap` / `--max-rounds` is hit (non-zero exit, no fake padding).
 
 ---
 
@@ -52,25 +94,25 @@ Open the package under `data/export/marathi_ocr_validation_100/`.
 
 ```text
 discover → render → extract → score → dedup → select
-       → ocr → validate → auto_accept → export
+       → ocr → validate → auto_accept ↻ (until target) → export
 ```
 
 | Stage | Script | Does |
 |-------|--------|------|
-| Discover | `scripts.discover` | Portals + built-in web seeds → PDFs |
+| Discover | `scripts.discover` | Portals + built-in web seeds → PDFs (skips already-ingested URLs) |
 | Render | `scripts.render` | Pages @ 300 DPI |
 | Extract | `scripts.extract` | Dual-lane crops @ 600 DPI (text + visual bands) |
 | Score | `scripts.score` | `hard` / `normal` / reject |
 | Dedup | `scripts.dedup_candidates` | Image / bbox / phash before OCR |
-| Select | `scripts.select_validation` | Source-diverse 80/20 quotas |
+| Select | `scripts.select_validation` | Source-diverse hard/normal quotas |
 | OCR | `scripts.ocr` | Pluggable pre-label (default Tesseract-mar) |
 | Validate | `scripts.validate` | Rules + optional Kimi vision flag |
-| Accept | `scripts.auto_accept` | PDF text → else OCR as label |
+| Accept | `scripts.auto_accept` | PDF text → else OCR as label; LLM complexity end-gate |
 | Export | `scripts.export` | Final package under `data/export/` |
 
 Orchestrator: `python -m scripts.run_pipeline`.
 
-Useful flags: `--skip-discover` · `--skip-llm-validate` · `--strict-quota` · `--with-review` (optional Streamlit).
+Useful flags: `--skip-discover` · `--skip-llm-validate` · `--allow-shortfall` · `--with-review` (optional Streamlit).
 
 ---
 
@@ -87,7 +129,7 @@ Marathi_OCR/
 ├── validation/        # numerals, dups, image QA
 ├── export/            # package writers
 ├── llm/               # optional Kimi client
-├── pipeline/          # config, IO, hashing, profiles
+├── pipeline/          # config, IO, hashing, profiles, quotas
 ├── review/            # optional Streamlit UI
 ├── benchmark/         # bakeoff metrics code
 ├── data/              # ALL runtime data (gitignored)
@@ -106,7 +148,7 @@ Client: `llm/client.py` · credentials from `.env` (never committed).
 | Use | When | Writes GT? |
 |-----|------|------------|
 | Discover assist | Rank / propose PDF URLs | No |
-| Vision QA | Flag image↔text mismatches | No |
+| Vision QA | Flag image↔text mismatches + complexity lane | No |
 
 Labels come from **PDF text layer**, else **OCR**. Pipeline still runs if the LLM is down (`--skip-llm-validate` or empty key).
 
@@ -129,6 +171,7 @@ LLM_MODEL=kimi-k3
 - **Seeds** — `discover_search_seeds` (no CLI `--query`)
 - **OCR** — `ocr_backend: tesseract` (bakeoff can change this)
 - **Export** — `validation_export_dir: data/export/marathi_ocr_validation_100`
+- **Mining** — `pipeline_max_rounds`, `pipeline_docs_per_round`, `pipeline_docs_growth`, `pipeline_max_docs_cap`
 
 Bakeoff:
 
@@ -144,8 +187,9 @@ Bakeoff:
 2. No silent ASCII→Marathi digit conversion under the hard profile.  
 3. Normal ≠ low complexity — ordinary prose without hard symbols.  
 4. Image-strict / text-soft dedup.  
-5. Quality before quota — report `73/80`, never pad.  
-6. Auto pipeline by default — Streamlit is opt-in (`--with-review`).
+5. Quality before quota — report `73/80`, never pad; with `--target-count`, keep mining instead.  
+6. Auto pipeline by default — Streamlit is opt-in (`--with-review`).  
+7. No GR keyword / `REFERENCE_PATTERNS` hardness — LLM vision is the hard end-gate.
 
 ---
 

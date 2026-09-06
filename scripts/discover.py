@@ -15,10 +15,25 @@ from llm.client import LLMClient
 from pipeline.config import load_config, resolve_path
 from pipeline.env_loader import load_dotenv
 from pipeline.ingest_render import ingest_file
-from pipeline.io_utils import write_json
+from pipeline.io_utils import read_json, write_json
 from pipeline.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
+
+
+def _ingested_urls(manifest_path: Path) -> set[str]:
+    if not manifest_path.is_file():
+        return set()
+    try:
+        manifest = read_json(manifest_path)
+    except Exception:  # noqa: BLE001
+        return set()
+    urls: set[str] = set()
+    for src in manifest.get("sources") or []:
+        u = (src.get("source_url") or "").strip()
+        if u:
+            urls.add(u)
+    return urls
 
 
 def main() -> None:
@@ -34,6 +49,11 @@ def main() -> None:
     )
     parser.add_argument("--no-llm-rank", action="store_true", help="Skip optional Kimi ranking")
     parser.add_argument("--no-ingest", action="store_true", help="Download only; skip raw/ ingest")
+    parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Do not skip URLs already in the source manifest (default: skip)",
+    )
     parser.add_argument("--doc-type", default="government_resolution")
     parser.add_argument(
         "--exclude-list",
@@ -57,11 +77,15 @@ def main() -> None:
     if isinstance(seeds, str):
         seeds = [seeds]
 
+    already = set() if args.include_existing else _ingested_urls(manifest)
+    # Ask discovery for a larger ranked pool so skip-existing still yields max-docs
+    pool = max(args.max_docs * 5, args.max_docs + len(already) + 8)
+
     client = LLMClient.from_config(cfg)
     discovery = discover_pdf_candidates(
         None,
         client,
-        max_urls=max(args.max_docs * 3, args.max_docs),
+        max_urls=pool,
         use_portals=not args.no_portals,
         use_ddg=use_ddg,
         llm_rank=llm_rank,
@@ -72,7 +96,7 @@ def main() -> None:
     urls = [r["url"] for r in ranked if r.get("url")]
     write_json(sources / "discovery_last.json", discovery)
     logger.info(
-        "Discovery auto: portals=%s ddg=%s seeds=%s kimi=%s excluded=%s candidates=%s ranked=%s",
+        "Discovery auto: portals=%s ddg=%s seeds=%s kimi=%s excluded=%s candidates=%s ranked=%s skip_existing=%s",
         discovery.get("portal_count"),
         discovery.get("web_search_count"),
         len(discovery.get("search_seeds") or []),
@@ -80,10 +104,21 @@ def main() -> None:
         discovery.get("excluded_count"),
         discovery.get("candidate_count"),
         len(urls),
+        len(already),
     )
 
-    results = download_many(urls, downloads, max_docs=args.max_docs)
-    ok_paths = [r for r in results if r.get("ok") and r.get("path")]
+    results = download_many(
+        urls,
+        downloads,
+        max_docs=args.max_docs,
+        skip_urls=already,
+    )
+    ok_paths = [r for r in results if r.get("ok") and r.get("path") and not r.get("deduped") and not r.get("skipped")]
+    # Also ingest deduped hits that map to on-disk PDFs not yet in manifest
+    for r in results:
+        if r.get("ok") and r.get("path") and r.get("deduped") and r.get("url") not in already:
+            if r not in ok_paths:
+                ok_paths.append(r)
     write_json(
         sources / "discovery_downloads.json",
         {
@@ -91,6 +126,7 @@ def main() -> None:
             "search_seeds": discovery.get("search_seeds"),
             "downloads": results,
             "ok": len(ok_paths),
+            "skipped_existing": len(already),
         },
     )
 
@@ -112,12 +148,17 @@ def main() -> None:
 
     print(
         f"Discover done: downloaded_ok={len(ok_paths)} ingested={ingested} "
-        f"dir={downloads} report={sources / 'discovery_last.json'}"
+        f"skipped_existing={len(already)} dir={downloads} report={sources / 'discovery_last.json'}"
     )
     if discovery.get("llm_error"):
         print(
             f"Note: Kimi rank soft-failed ({discovery['llm_error'][:160]}); "
             "portal/DDG results still used."
+        )
+    if ingested == 0 and args.max_docs > 0:
+        print(
+            "WARNING: no new documents ingested this round "
+            "(sources exhausted, portals blocked, or all candidates already present)."
         )
 
 

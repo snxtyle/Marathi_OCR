@@ -5,16 +5,18 @@ import unicodedata
 from typing import Any
 
 from pipeline.char_limits import char_count, in_char_band
-from scoring.reference_detector import reference_pattern_score
+from scoring.reference_detector import identifier_likeness_score
 
 MARATHI_DIGITS = "०१२३४५६७८९"
 ASCII_DIGITS = "0123456789"
-SPECIAL_CHARS = "/.,-—:;()[]*%₹«»“”|"
+SPECIAL_CHARS = "/.,-—–:;()[]*%₹«»“”|"
 # Devanagari matras / vowel signs
 MATRA_RE = re.compile(r"[\u093A-\u094C\u094E\u094F\u0955-\u0957\u0962\u0963]")
 VIRAMA = "\u094d"
-HARD_SYMBOL_RE = re.compile(r"[/₹%—–:;\[\]*]|प्र\.?\s*क्र|शासन\s*निर्णय|अधिसूचना")
-SLASH_ID_RE = re.compile(r"[०-९0-9].*/.*[०-९0-9]|प्र\.?\s*क्र")
+# Instant-fail hard symbols for ordinary-prose gate.
+# Colons/parens/brackets are gated separately via hardish counts so light
+# list markers like "(क)" still count as ordinary Marathi.
+HARD_PUNCT_RE = re.compile(r"[/₹%—–\*\[\]]")
 
 TRIVIAL_REJECT = [
     re.compile(r"^महाराष्ट्र\.?$"),
@@ -44,6 +46,7 @@ def compute_features(text: str) -> dict[str, Any]:
     special = _count_chars(text, SPECIAL_CHARS)
     marathi_digits = _count_chars(text, MARATHI_DIGITS)
     ascii_digits = _count_chars(text, ASCII_DIGITS)
+    id_like = identifier_likeness_score(text)
     return {
         "marathi_digit_count": marathi_digits,
         "ascii_digit_count": ascii_digits,
@@ -65,27 +68,30 @@ def compute_features(text: str) -> dict[str, Any]:
         "word_count": len(words),
         "numeric_density": (marathi_digits + ascii_digits) / max(length, 1),
         "special_character_density": special / max(length, 1),
-        "reference_pattern_score": reference_pattern_score(text),
+        "identifier_likeness_score": id_like,
+        # Legacy key kept for older callers; same as identifier_likeness
+        "reference_pattern_score": id_like,
         "dense_text_score": min(len(words) / 8.0, 3.0) + min(length / 80.0, 2.0),
     }
 
 
 def complexity_score(text: str) -> float:
+    """Generic OCR-hardness ranking score (no keyword boosts)."""
     f = compute_features(text)
     score = 0.0
-    score += min(f["marathi_digit_count"], 12) * 0.35
-    score += min(f["slash_count"], 6) * 0.6
-    score += min(f["period_count"], 10) * 0.2
-    score += min(f["hyphen_count"] + f["dash_count"], 6) * 0.35
-    score += min(f["comma_count"] + f["colon_count"], 8) * 0.15
-    score += min(f["bracket_count"], 6) * 0.25
+    score += min(f["marathi_digit_count"], 12) * 0.45
+    score += min(f["slash_count"], 6) * 0.35  # mild; alone does not make hard
+    score += min(f["period_count"], 10) * 0.15
+    score += min(f["hyphen_count"] + f["dash_count"], 6) * 0.25
+    score += min(f["comma_count"] + f["colon_count"], 8) * 0.12
+    score += min(f["bracket_count"], 6) * 0.2
     score += min(f["currency_count"] + f["percent_count"], 4) * 0.5
-    score += min(f["conjunct_estimate"], 15) * 0.12
+    score += min(f["conjunct_estimate"], 15) * 0.15
     score += f["matra_score"]
-    score += f["reference_pattern_score"]
+    score += f["identifier_likeness_score"] * 0.8
     score += f["dense_text_score"]
     score += f["special_character_density"] * 8
-    score += f["numeric_density"] * 6
+    score += f["numeric_density"] * 8
     score -= f["ascii_digit_count"] * 0.5
     return round(score, 4)
 
@@ -159,7 +165,7 @@ def is_trivial(
 
 
 def is_ordinary_prose(text: str) -> bool:
-    """True if text is ordinary Marathi — not OCR-hard-symbol selected."""
+    """True if text is ordinary Marathi — suitable for the normal lane."""
     t = unicodedata.normalize("NFC", (text or "").strip())
     if not t:
         return False
@@ -168,20 +174,43 @@ def is_ordinary_prose(text: str) -> bool:
         return False
     if f["currency_count"] or f["percent_count"]:
         return False
-    if f["reference_pattern_score"] > 0:
+    if f["identifier_likeness_score"] > 0:
         return False
-    if f["slash_count"] > 0 or SLASH_ID_RE.search(t):
+    if f["slash_count"] > 0:
         return False
-    if HARD_SYMBOL_RE.search(t):
+    if HARD_PUNCT_RE.search(t):
         return False
-    # Allow light prose punctuation (. , ।) but not dense hard specials
-    hardish = f["slash_count"] + f["colon_count"] + f["semicolon_count"] + f["bracket_count"]
-    hardish += f["hyphen_count"] + f["dash_count"] + f["currency_count"] + f["percent_count"]
+    hardish = f["colon_count"] + f["semicolon_count"] + f["bracket_count"]
+    hardish += f["hyphen_count"] + f["dash_count"]
     if hardish > 2:
         return False
     if f["special_character_density"] > 0.06:
         return False
     return True
+
+
+def strong_generic_hard_signals(features: dict[str, Any]) -> bool:
+    """Multi-signal OCR hardness — never keyword-based, never slash-alone.
+
+    Requires numerals, identifier-like digit+separator structure, and/or
+    currency/percent. Multi-slash office titles without digits are NOT hard
+    (LLM may later promote them if vision judges them complex).
+    """
+    digits = int(features.get("marathi_digit_count") or 0)
+    id_like = float(features.get("identifier_likeness_score") or 0)
+    currency = int(features.get("currency_count") or 0) + int(features.get("percent_count") or 0)
+    symbols = int(features.get("symbol_count") or 0)
+    slash = int(features.get("slash_count") or 0)
+
+    if digits >= 2:
+        return True
+    if digits >= 1 and (id_like > 0 or slash >= 1 or symbols >= 3):
+        return True
+    if id_like >= 1.5:
+        return True
+    if currency >= 1 and (digits >= 1 or symbols >= 2):
+        return True
+    return False
 
 
 def classify_difficulty(
@@ -197,8 +226,17 @@ def classify_difficulty(
     max_chars: int | None = None,
     allow_ascii_digits: bool = False,
     score_override: float | None = None,
+    llm_complexity: str | None = None,
 ) -> dict[str, Any]:
-    """Assign hard | normal | reject with reasons."""
+    """Assign hard | normal | reject.
+
+    Heuristic path uses only generic structural signals (digits, punctuation
+    density, conjuncts, identifier-likeness). Keyword/GR lists are not used.
+
+    When ``llm_complexity`` is ``hard|normal|reject``, it is authoritative
+    (after trivial/ASCII gates). Soft-fail: omit llm_complexity and weak
+    slash-only lines will NOT become hard.
+    """
     scored = score_candidate(
         text,
         min_words=min_words,
@@ -216,51 +254,158 @@ def classify_difficulty(
             **scored,
             "difficulty": "reject",
             "reject_reasons": ["ascii_digits"],
+            "hard_signal_source": "none",
         }
-    if scored["is_trivial"] or scored.get("is_too_long"):
+
+    llm_label = (llm_complexity or "").strip().lower()
+    if llm_label in {"hard", "normal", "reject"}:
+        if llm_label == "reject":
+            return {
+                **scored,
+                "difficulty": "reject",
+                "reject_reasons": ["llm_complexity_reject"],
+                "hard_signal_source": "llm",
+            }
+        if scored["is_trivial"] or scored.get("is_too_long"):
+            if not (
+                f.get("marathi_digit_count", 0) > 0
+                or f.get("identifier_likeness_score", 0) > 0
+            ):
+                return {
+                    **scored,
+                    "difficulty": "reject",
+                    "reject_reasons": ["trivial_or_too_long"],
+                    "hard_signal_source": "llm",
+                }
+        wc_llm = int(scored["word_count"])
+        # Never let LLM force ordinary flowing prose into the hard lane.
+        # LLM may still promote weak slash/title lines (not ordinary) to hard.
+        if (
+            llm_label == "hard"
+            and is_ordinary_prose(text)
+            and normal_min_words <= wc_llm <= normal_max_words
+            and not strong_generic_hard_signals(f)
+        ):
+            return {
+                **scored,
+                "complexity_score": min(scored["complexity_score"], max_normal_score),
+                "difficulty": "normal",
+                "reject_reasons": [],
+                "hard_signal_source": "llm_demoted_ordinary",
+            }
         return {
             **scored,
-            "difficulty": "reject",
-            "reject_reasons": ["trivial_or_too_long"],
+            "difficulty": llm_label,
+            "reject_reasons": [],
+            "hard_signal_source": "llm",
         }
+
+    if scored["is_trivial"] or scored.get("is_too_long"):
+        f0 = scored["features"]
+        if not (
+            f0.get("marathi_digit_count", 0) > 0
+            or f0.get("identifier_likeness_score", 0) > 0
+        ):
+            return {
+                **scored,
+                "difficulty": "reject",
+                "reject_reasons": ["trivial_or_too_long"],
+                "hard_signal_source": "none",
+            }
 
     wc = scored["word_count"]
     score = scored["complexity_score"]
 
-    # Normal first: ordinary Marathi prose must not be taken for hard-symbol reasons
-    if (
-        is_ordinary_prose(text)
-        and normal_min_words <= wc <= normal_max_words
-    ):
-        # Cap displayed score for normal lane reporting; keep features intact
+    if is_ordinary_prose(text) and normal_min_words <= wc <= normal_max_words:
         return {
             **scored,
             "complexity_score": min(score, max_normal_score),
             "difficulty": "normal",
             "reject_reasons": [],
+            "hard_signal_source": "heuristic_ordinary",
         }
 
-    # Hard lane: refs / numerals / hard punctuation / high complexity with hard signals
-    hard_signal = (
-        f["reference_pattern_score"] > 0
-        or f["marathi_digit_count"] > 0
-        or f["slash_count"] > 0
-        or f["currency_count"] > 0
-        or f["percent_count"] > 0
-        or f["symbol_count"] >= 3
-        or score >= min_hard_score
-    )
-    if hard_signal and score >= min_hard_score:
-        return {**scored, "difficulty": "hard", "reject_reasons": []}
-    if hard_signal and (
-        f["reference_pattern_score"] > 0
-        or f["marathi_digit_count"] > 0
-        or f["slash_count"] > 0
-    ):
-        return {**scored, "difficulty": "hard", "reject_reasons": []}
+    # Hard only with strong generic multi-signals — never slash-alone titles
+    if strong_generic_hard_signals(f) and score >= min_hard_score:
+        return {
+            **scored,
+            "difficulty": "hard",
+            "reject_reasons": [],
+            "hard_signal_source": "heuristic_strong",
+        }
 
-    reasons.append("neither_hard_nor_ordinary_prose")
-    return {**scored, "difficulty": "reject", "reject_reasons": reasons}
+    # Weak slash / light punctuation without digits → not hard, not normal
+    reasons.append("weak_complexity_awaiting_llm_or_stronger_signals")
+    return {
+        **scored,
+        "difficulty": "reject",
+        "reject_reasons": reasons,
+        "hard_signal_source": "none",
+    }
+
+
+def apply_llm_complexity(
+    rec: dict[str, Any],
+    llm_complexity: str | None,
+    *,
+    text: str | None = None,
+    allow_ascii_digits: bool = False,
+    min_hard_score: float = 3.0,
+) -> dict[str, Any]:
+    """Re-label a record using LLM hard|normal|reject (authoritative)."""
+    t = text
+    if t is None:
+        t = rec.get("expected_text") or rec.get("text_assist") or rec.get("ocr_prediction") or ""
+    classified = classify_difficulty(
+        t,
+        allow_ascii_digits=allow_ascii_digits,
+        min_hard_score=min_hard_score,
+        llm_complexity=llm_complexity,
+        score_override=rec.get("complexity_score"),
+    )
+    rec["difficulty"] = classified["difficulty"]
+    rec["complexity_score"] = classified["complexity_score"]
+    rec["features"] = classified.get("features") or rec.get("features")
+    rec["hard_signal_source"] = classified.get("hard_signal_source")
+    rec["contains_marathi_numerals"] = classified.get("contains_marathi_numerals")
+    rec["contains_special_chars"] = classified.get("contains_special_chars")
+    rec["contains_reference_identifier"] = classified.get("contains_reference_identifier")
+    rec["contains_conjuncts"] = classified.get("contains_conjuncts")
+    if classified["difficulty"] == "reject":
+        rec["reject_reasons"] = list(
+            dict.fromkeys(
+                (rec.get("reject_reasons") or []) + (classified.get("reject_reasons") or [])
+            )
+        )
+    return rec
+
+
+def demote_unconfirmed_hard(rec: dict[str, Any]) -> dict[str, Any]:
+    """If LLM soft-failed, keep hard only with strong generic signals.
+
+    Prevents title-slash prose from silently filling the hard lane.
+    """
+    if rec.get("difficulty") != "hard":
+        return rec
+    src = rec.get("hard_signal_source") or ""
+    if src == "llm":
+        return rec
+    features = rec.get("features") or {}
+    if not features:
+        text = rec.get("expected_text") or rec.get("text_assist") or ""
+        features = compute_features(text)
+        rec["features"] = features
+    if strong_generic_hard_signals(features):
+        rec["hard_signal_source"] = "heuristic_strong_soft_fail"
+        return rec
+    rec["difficulty"] = "reject"
+    rec["reject_reasons"] = list(
+        dict.fromkeys(
+            (rec.get("reject_reasons") or []) + ["hard_unconfirmed_llm_soft_fail"]
+        )
+    )
+    rec["hard_signal_source"] = "demoted_soft_fail"
+    return rec
 
 
 def score_candidate(
@@ -291,6 +436,6 @@ def score_candidate(
         "is_trivial": trivial or too_long,
         "contains_marathi_numerals": features["marathi_digit_count"] > 0,
         "contains_special_chars": features["symbol_count"] > 0,
-        "contains_reference_identifier": features["reference_pattern_score"] > 0,
+        "contains_reference_identifier": features["identifier_likeness_score"] > 0,
         "contains_conjuncts": features["conjunct_estimate"] > 0,
     }

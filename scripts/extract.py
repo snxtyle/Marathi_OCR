@@ -49,6 +49,8 @@ def main() -> None:
         default=None,
         help="Maximum NFC character length (inclusive). Enables word-span cropping for short bands.",
     )
+    parser.add_argument("--hard-count", type=int, default=None, help="Override hard lane target (ratio)")
+    parser.add_argument("--normal-count", type=int, default=None, help="Override normal lane target (ratio)")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -56,6 +58,7 @@ def main() -> None:
     profile = get_active_profile(cfg)
     allow_ascii = allow_ascii_digits(cfg)
     # Dual-lane: pull both hard and ordinary prose; selection enforces quotas later
+    # Hardness uses generic signals only (no GR keyword / require_hard_ref gates)
     min_score = float(args.min_score) if args.min_score else 0.0
     min_words, max_words = resolve_word_limits(cfg, min_words=args.min_words, max_words=args.max_words)
     min_chars, max_chars = resolve_char_limits(cfg, min_chars=args.min_chars, max_chars=args.max_chars)
@@ -73,7 +76,21 @@ def main() -> None:
     min_w = suggested_min_width(max_chars, int(cfg.get("min_width", 800)))
 
     manifest = read_json(sources / "manifest.json")
-    all_cands = []
+    from pipeline.quotas import scale_lane_targets
+
+    hard_target, normal_target = scale_lane_targets(
+        hard_count=args.hard_count,
+        normal_count=args.normal_count,
+        profile=profile,
+        cfg=cfg,
+    )
+    lane_total = max(hard_target + normal_target, 1)
+    # Per-source: keep a normal share so digit-heavy pages cannot fill the cap alone
+    normal_share = max(1, int(round(args.max_per_source * (normal_target / lane_total))))
+    hard_share = max(1, args.max_per_source - normal_share)
+
+    all_hard: list = []
+    all_normal: list = []
     per_source: dict[str, int] = {}
     for src in manifest.get("sources", []):
         if Path(src["source_path"]).suffix.lower() != ".pdf":
@@ -95,15 +112,61 @@ def main() -> None:
             allow_ascii_digits=allow_ascii,
             dual_lane=True,
         )
-        for c in cands:
-            sid = c["source_id"]
-            if per_source.get(sid, 0) >= args.max_per_source:
-                continue
-            per_source[sid] = per_source.get(sid, 0) + 1
-            all_cands.append(c)
+        hard_c = sorted(
+            [c for c in cands if c.get("difficulty") == "hard"],
+            key=lambda c: c.get("complexity_score") or 0,
+            reverse=True,
+        )
+        normal_c = sorted(
+            [c for c in cands if c.get("difficulty") == "normal"],
+            key=lambda c: c.get("word_count") or 0,
+            reverse=True,
+        )
+        sid = src["source_id"]
+        picked: list = []
+        for c in hard_c[:hard_share]:
+            picked.append(c)
+        for c in normal_c[:normal_share]:
+            if len(picked) >= args.max_per_source:
+                break
+            picked.append(c)
+        # Fill leftover cap from whichever lane still has inventory
+        if len(picked) < args.max_per_source:
+            rest = [c for c in hard_c[hard_share:] + normal_c[normal_share:] if c not in picked]
+            for c in rest:
+                if len(picked) >= args.max_per_source:
+                    break
+                picked.append(c)
+        per_source[sid] = len(picked)
+        for c in picked:
+            if c.get("difficulty") == "normal":
+                all_normal.append(c)
+            else:
+                all_hard.append(c)
 
-    all_cands.sort(key=lambda c: c["complexity_score"], reverse=True)
-    selected = all_cands[: args.top_k]
+    # Global top-k also reserves a normal lane (profile ratio, with headroom)
+    n_normal_slots = min(
+        len(all_normal),
+        max(normal_target * 2, int(round(args.top_k * (normal_target / lane_total)))),
+    )
+    n_hard_slots = min(len(all_hard), max(0, args.top_k - n_normal_slots))
+    # If hard inventory is short, give leftover slots back to normal (and vice versa)
+    if n_hard_slots < args.top_k - n_normal_slots:
+        n_normal_slots = min(len(all_normal), args.top_k - n_hard_slots)
+    if n_normal_slots + n_hard_slots < args.top_k:
+        n_hard_slots = min(len(all_hard), args.top_k - n_normal_slots)
+
+    all_hard.sort(key=lambda c: c.get("complexity_score") or 0, reverse=True)
+    all_normal.sort(key=lambda c: c.get("word_count") or 0, reverse=True)
+    selected = all_hard[:n_hard_slots] + all_normal[:n_normal_slots]
+    logger.info(
+        "Dual-lane extract pool: hard=%d/%d normal=%d/%d (top_k=%d)",
+        n_hard_slots,
+        len(all_hard),
+        n_normal_slots,
+        len(all_normal),
+        args.top_k,
+    )
 
     dpi = int(cfg.get("hard_crop_dpi", 600))
     # Tighter margins for short character crops
